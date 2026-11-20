@@ -151,6 +151,15 @@ localbuild/build60.log (path dxb->ci-clean2) and relinked with ci-clean2/build.l
   2.3 ms, gap 17.9 ms -> **300 swaps per 5 s = 60.0** all boot, no fault. Lock clock text NOT
   verified (shots show home/app switcher); daily image rebuilt with this bundle (01:34) for
   the user to check. If the text is missing: bisect fill vs invalidate.
+- **Blur/transparency (probes 127-128, 2026-11-21 01:45-02:09):** CA's blur passes render into
+  private format 550 (IOSurface 'b3a8', 4 B/px) which was rejected -> blurs never drawn. 8fc73da:
+  550 as BGRA8 (`sky_is_bgra8`), BGR10_XR 554/555 ('w30r', backdrop captures) as 10_10_10_2 UNORM
+  (TP 0x36, RB 0x37) incl. fbfetch descriptor and packed clears. User photos (probe127): blur is
+  smooth during the CC animation, but with CC fully open the home screen behind is sharp (no
+  live backdrop blur) -> 554 support added for that (probe128, not touched by the user).
+  probe128 lock screen shot: **clock text present with the shared fbfetch scratch** (fixes the
+  probe100-107 problem). Still rejected: RGBA16Float (115) render targets (64 px wide).
+  Daily image rebuilt with bundle 8fc73da + k125 (02:10).
   - Still open: formats 550/554 (BGRA10_XR, 19 draws), 2 programs with color_opcodes arrays, the
     fbfetch scratch reuse (lock clock text), the user asked for an iOS upgrade after stabilising.
 - **`skyios-shim/out/shim-boot-skyios-gpu.img`** (2026-11-20 12:40): daily cmdline (no auto

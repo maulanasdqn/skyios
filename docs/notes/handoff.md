@@ -144,6 +144,13 @@ localbuild/build60.log (path dxb->ci-clean2) and relinked with ci-clean2/build.l
   After 1635 frames no more frames for 7 min (not known whether the user still touched).
   Daily image rebuilt with k125 (01:13). Render: 52-57 swaps/s while animating; the gap to 60 is
   probably the per-commit framebuffer-fetch copy (~6.5 ms) + scratch allocation (~5 ms CPU).
+- **60 fps (probe126, 2026-11-21 01:27, observed):** f04f1aa = fbfetch scratch shared by all
+  frames (static, per size), CACHE_INVALIDATE before the copy (it was missing: the copy reads
+  the target through the TP) and a 2D zero fill of the scratch before the copy (probe105 kept
+  the lock text that way). perf: fb 18 us/commit (was 5.5 ms), draw 0.9 ms/commit, commit
+  2.3 ms, gap 17.9 ms -> **300 swaps per 5 s = 60.0** all boot, no fault. Lock clock text NOT
+  verified (shots show home/app switcher); daily image rebuilt with this bundle (01:34) for
+  the user to check. If the text is missing: bisect fill vs invalidate.
   - Still open: formats 550/554 (BGRA10_XR, 19 draws), 2 programs with color_opcodes arrays, the
     fbfetch scratch reuse (lock clock text), the user asked for an iOS upgrade after stabilising.
 - **`skyios-shim/out/shim-boot-skyios-gpu.img`** (2026-11-20 12:40): daily cmdline (no auto

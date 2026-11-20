@@ -266,6 +266,9 @@ NSUInteger sky_tex_bpe(MTLPixelFormat f) {
     case MTLPixelFormatRG8Unorm:
     case MTLPixelFormatR16Float:
         return 2;
+    case SkyPixelFormatB3A8:
+    case MTLPixelFormatBGR10_XR:
+    case MTLPixelFormatBGR10_XR_sRGB:
     case MTLPixelFormatBGRA8Unorm:
     case MTLPixelFormatBGRA8Unorm_sRGB:
     case MTLPixelFormatRGBA8Unorm:

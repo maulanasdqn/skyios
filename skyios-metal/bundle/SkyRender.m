@@ -476,6 +476,7 @@ static BOOL tex_format(MTLPixelFormat f, uint32_t *fmt, uint32_t *swap, uint32_t
     *swiz = SWZ(X, Y, Z, W);
     switch (f) {
     case MTLPixelFormatBGRA8Unorm_sRGB: *srgb = YES; /* fallthrough */
+    case SkyPixelFormatB3A8:
     case MTLPixelFormatBGRA8Unorm: *fmt = 0x30; *swap = 1; return YES;
     case MTLPixelFormatRGBA8Unorm_sRGB: *srgb = YES; /* fallthrough */
     case MTLPixelFormatRGBA8Unorm: *fmt = 0x30; return YES;
@@ -486,6 +487,8 @@ static BOOL tex_format(MTLPixelFormat f, uint32_t *fmt, uint32_t *swap, uint32_t
     case MTLPixelFormatRG16Float: *fmt = 0x45; *swiz = SWZ(X, Y, ZERO, ONE); return YES;
     case MTLPixelFormatR32Float: *fmt = 0x4a; *swiz = SWZ(X, ZERO, ZERO, ONE); return YES;
     case MTLPixelFormatRGBA16Float: *fmt = 0x62; return YES;
+    case MTLPixelFormatBGR10_XR_sRGB: *srgb = YES; /* fallthrough */
+    case MTLPixelFormatBGR10_XR: *fmt = 0x36; *swiz = SWZ(X, Y, Z, ONE); return YES; // FMT6_10_10_10_2_UNORM
     case MTLPixelFormatASTC_4x4_sRGB: *srgb = YES; /* fallthrough */
     case MTLPixelFormatASTC_4x4_LDR: *fmt = 0xc1; return YES; // FMT6_ASTC_4x4
     default: return NO;
@@ -1003,7 +1006,9 @@ uint64_t sky_perf_draw_ticks, sky_perf_draws, sky_perf_tex_ticks, sky_perf_fb_ti
                 return;
             }
             memset(tex[i], 0, 64);
-            tex[i][0] = (0 | 1 << 3 | 2 << 6 | 3 << 9) << 4 | (FMT6_8_8_8_8_UNORM << 22) | ((_info >> 13 & 3) << 30);
+            // the target's format: RB uses 10_10_10_2_UNORM_DEST (0x37), the TP 0x36
+            uint32_t tfmt = (_info & 0xff) == 0x37 ? 0x36 : FMT6_8_8_8_8_UNORM;
+            tex[i][0] = (0 | 1 << 3 | 2 << 6 | 3 << 9) << 4 | (tfmt << 22) | ((_info >> 13 & 3) << 30);
             tex[i][1] = _w | (_h << 15);
             tex[i][2] = ((uint32_t)_rt.bpr << 7) | (1u << 29);
             tex[i][4] = (uint32_t)fb;
@@ -1579,7 +1584,7 @@ uint64_t sky_perf_draw_ticks, sky_perf_draws, sky_perf_tex_ticks, sky_perf_fb_ti
     if (surf) {
         SkyImport im;
         MTLPixelFormat f = _tex.pixelFormat;
-        if ((f != MTLPixelFormatBGRA8Unorm && f != MTLPixelFormatBGRA8Unorm_sRGB && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) || !import_surface(surf, &im) || (im.bpr & 63))
+        if ((!sky_is_bgra8(f) && f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB) || !import_surface(surf, &im) || (im.bpr & 63))
             return NO;
         *outBase = im.iova + im.offset;
         *outBpr = (uint32_t)im.bpr;
@@ -1590,7 +1595,7 @@ uint64_t sky_perf_draw_ticks, sky_perf_draws, sky_perf_tex_ticks, sky_perf_fb_ti
         MTLPixelFormat bf = _tex.pixelFormat;
         // the descriptor is RGBA8 only: an A8/RG8 buffer read as RGBA8 runs
         // past the rows (and the buffer)
-        if (bg && bf != MTLPixelFormatBGRA8Unorm && bf != MTLPixelFormatBGRA8Unorm_sRGB &&
+        if (bg && !sky_is_bgra8(bf) &&
             bf != MTLPixelFormatRGBA8Unorm && bf != MTLPixelFormatRGBA8Unorm_sRGB) {
             static int nlf; if (nlf++ < 3) sky_log("texGpu: buf fmt %lu not RGBA8, skipped", (unsigned long)bf);
             return NO;
@@ -1692,11 +1697,20 @@ static void begin_pass(NSMutableData *s, SkyImport rt, uint32_t w, uint32_t h, M
     // clear colour as UNORM8 per channel; RB writes R into the low byte, so
     // swap R/B for BGRA memory order
     MTLClearColor cc = c.clearColor;
-    BOOL bgra = c.texture.pixelFormat == MTLPixelFormatBGRA8Unorm || c.texture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB;
+    BOOL bgra = sky_is_bgra8(c.texture.pixelFormat);
     double ch[4] = {bgra ? cc.blue : cc.red, cc.green, bgra ? cc.red : cc.blue, cc.alpha};
     uint32_t rgba[4];
     for (int i = 0; i < 4; i++)
         rgba[i] = (uint32_t)lround(fmin(fmax(ch[i], 0), 1) * 255);
+    if (sky_is_xr10(c.texture.pixelFormat)) {
+        // 10_10_10_2: the 2D fill writes bytes, so give it the packed word's bytes
+        double x[3] = {cc.red, cc.green, cc.blue};
+        uint32_t w = 3u << 30;
+        for (int i = 0; i < 3; i++)
+            w |= (uint32_t)lround(fmin(fmax(x[i], 0), 1) * 1023) << (10 * i);
+        for (int i = 0; i < 4; i++)
+            rgba[i] = (w >> (8 * i)) & 0xff;
+    }
     uint32_t blt = (1 << 7) | (FMT6_8_8_8_8_UNORM << 8) | (0xf << 20);
     reg1(s, 0x8c00, blt);                                      // RB_A2D_BLT_CNTL
     reg1(s, 0x8400, blt);                                      // GRAS_A2D_BLT_CNTL
@@ -1725,8 +1739,7 @@ id sky_draw_encoder(id<MTLDevice> dev, MTLRenderPassDescriptor *d, NSMutableData
     id<MTLTexture> t = c.texture;
     IOSurfaceRef surf = t.iosurface;
     MTLPixelFormat f = t.pixelFormat;
-    BOOL fmt_ok = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB ||
-                  f == MTLPixelFormatRGBA8Unorm_sRGB;
+    BOOL fmt_ok = sky_is_bgra8(f) || sky_is_xr10(f) || f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatRGBA8Unorm_sRGB;
     SkyImport rt = {0};
     BOOL cr = code_ready();
     // a render target is flushed from the CPU caches once, on its first use:
@@ -1764,8 +1777,9 @@ id sky_draw_encoder(id<MTLDevice> dev, MTLRenderPassDescriptor *d, NSMutableData
     uint32_t w = (uint32_t)t.width, h = (uint32_t)t.height;
     begin_pass(stream, rt, w, h, c);
     // BGRA memory order: COLOR_SWAP WXYZ (a3xx_color_swap 1) in RB_MRT[0].BUF_INFO
-    BOOL bgra = f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB;
-    uint32_t info = FMT6_8_8_8_8_UNORM | ((bgra ? 1u : 0u) << 13);
+    BOOL bgra = sky_is_bgra8(f);
+    uint32_t info = sky_is_xr10(f) ? 0x37u /* FMT6_10_10_10_2_UNORM_DEST */
+                                   : FMT6_8_8_8_8_UNORM | ((bgra ? 1u : 0u) << 13);
     SkyDrawEncoder *e = [[SkyDrawEncoder alloc] initWithStream:stream owner:owner target:rt surface:surf width:w height:h info:info];
     e.device = dev;
     return e;

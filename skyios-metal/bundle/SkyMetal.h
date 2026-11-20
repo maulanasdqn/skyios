@@ -58,6 +58,19 @@ BOOL sky_sampler_unnorm(id<MTLSamplerState> s);
 NSUInteger sky_tex_bpe(MTLPixelFormat f);
 // one row of a w x h level: bytes in it and rows in the level (pixels, or
 // 4x4 blocks of 16 bytes for ASTC 4x4); NO for formats not served
+// CoreAnimation's private pixel format 550 (IOSurface 'b3a8', 4 bytes per
+// pixel): the targets of its blur passes. Handled as BGRA8Unorm (probe121-126:
+// rejected, so blurs and materials were never drawn).
+#define SkyPixelFormatB3A8 ((MTLPixelFormat)550)
+// BGR10_XR ('w30r', 554/555): CA's backdrop captures. Stored as A6XX
+// 10_10_10_2 UNORM: the extended range is clamped, written and read alike.
+static inline BOOL sky_is_xr10(MTLPixelFormat f) {
+    return f == MTLPixelFormatBGR10_XR || f == MTLPixelFormatBGR10_XR_sRGB;
+}
+static inline BOOL sky_is_bgra8(MTLPixelFormat f) {
+    return f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB || f == SkyPixelFormatB3A8;
+}
+
 BOOL sky_tex_layout(MTLPixelFormat f, NSUInteger w, NSUInteger h, NSUInteger *rowBytes, NSUInteger *rows);
 
 // methods copied into the runtime-made _MTLDevice subclass

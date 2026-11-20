@@ -859,34 +859,60 @@ static void load_ubos(NSMutableData *s, uint32_t op, uint32_t sb, const SkyProgU
 // engine into memory freed with the command buffer (sampling the attachment
 // while drawing into it hung the GPU, probe84/85)
 - (uint64_t)fbCopy {
-    // one scratch per command buffer and size, fresh (zero) memory each time.
-    // Reusing scratch memory (shared by all frames, probe100/107/111a, or
-    // through the pool, probe103) loses the lock screen's clock text although
-    // the copy works (a zeroed scratch without the copy gives a black screen,
-    // probe106); neither a full 2D scissor (probe107) nor waiting for the CCU
-    // flushes (probe111a) helped: unexplained. Costs ~5 ms of CPU per command
-    // buffer (allocation), the gap to 60 fps.
-    static const char key;
-    NSMutableDictionary<NSNumber *, SkyUpload *> *scratch = objc_getAssociatedObject(_owner, &key);
-    if (!scratch) {
-        scratch = [NSMutableDictionary dictionary];
-        objc_setAssociatedObject(_owner, &key, scratch, OBJC_ASSOCIATION_RETAIN);
-    }
+    // one scratch per size shared by all frames (the GPU runs submissions in
+    // order). A fresh 11 MB allocation per command buffer (probe104) cost
+    // ~5.3 ms per commit, the gap to 60 fps. Reused memory used to lose the
+    // lock screen's clock text (probe100/103/107, unexplained); zero-filling
+    // it with the 2D engine before the copy kept the text (probe105), and the
+    // texture caches were never invalidated before the copy reads the target.
+    static NSMutableDictionary<NSNumber *, SkyUpload *> *scratch;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
     size_t size = ((size_t)_rt.bpr * _h + 4095) & ~(size_t)4095;
+    os_unfair_lock_lock(&lock);
+    if (!scratch)
+        scratch = [NSMutableDictionary dictionary];
     SkyUpload *up = scratch[@(size)];
     if (!up) {
         up = [SkyUpload new];
-        if (!sky_alloc(size, &up->mem))
+        if (!sky_alloc(size, &up->mem)) {
+            os_unfair_lock_unlock(&lock);
             return 0;
+        }
         scratch[@(size)] = up;
     }
+    os_unfair_lock_unlock(&lock);
     const SkyMem *u = &up->mem;
     NSMutableData *s = _s;
     uint64_t ts = sky_code.iova + CODE_TS;
     wfi(s);
     ccu_flush_wait(s, ts); // draws so far reach memory
     event(s, 0x19);        // PC_CCU_INVALIDATE_COLOR
+    event(s, 0x31);        // CACHE_INVALIDATE: the copy reads the target through the TP
     wfi(s);
+    {
+        // zero the scratch first (2D solid fill)
+        uint32_t fill = (1 << 7) | (FMT6_8_8_8_8_UNORM << 8) | (0xf << 20);
+        reg1(s, 0x8c00, fill);
+        reg1(s, 0x8400, fill);
+        reg1(s, 0xacc0, (FMT6_8_8_8_8_UNORM << 3) | (0xf << 12));
+        reg1(s, 0x8c01, 0);
+        uint64_t d = u->iova;
+        uint32_t info[4] = {FMT6_8_8_8_8_UNORM, (uint32_t)d, (uint32_t)(d >> 32), (uint32_t)(_rt.bpr >> 6)};
+        reg(s, 0x8c17, info, 4);
+        uint32_t z3[3] = {0, 0, 0}, z4[4] = {0, 0, 0, 0};
+        reg(s, 0x8c20, z3, 3);
+        reg(s, 0x8c2c, z4, 4);
+        uint32_t tl[2] = {0, (_w - 1) | ((_h - 1) << 16)};
+        reg(s, 0x8405, tl, 2);
+        event(s, 0x3f);
+        wfi(s);
+        emit(s, pkt7(0x2c, 1));
+        emit(s, 3);
+        wfi(s);
+        ccu_flush_wait(s, ts);
+        event(s, 0x19);
+        wfi(s);
+    }
     uint32_t fmt = FMT6_8_8_8_8_UNORM, blt = (fmt << 8) | (0xf << 20);
     reg1(s, 0x8c00, blt);                       // RB_A2D_BLT_CNTL
     reg1(s, 0x8400, blt);                       // GRAS_A2D_BLT_CNTL

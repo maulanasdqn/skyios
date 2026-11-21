@@ -84,6 +84,7 @@ static uint32_t fbits(float f) {
 }
 
 #define FMT6_8_8_8_8_UNORM 0x30
+#define FMT6_16_16_16_16_FLOAT 0x62
 #define CCU_CNTL_BYPASS ((0x10000 >> 12) << 23)
 
 #pragma mark - built-in programs
@@ -361,6 +362,146 @@ static void note_surface(id owner, const SkyImport *im) {
 }
 NSSet<NSNumber *> *sky_surfaces_of(id owner) {
     return objc_getAssociatedObject(owner, &sky_surface_key);
+}
+
+// Surfaces whose rows are not 64-byte aligned (app snapshots 1125 px wide:
+// 4512 bytes per row) cannot be A6XX render targets or GPU-read textures.
+// They are drawn into a shadow copy with aligned rows, which later draws
+// sample, and the shadow is copied back into the surface by the CPU when the
+// command buffer completes (daily image 2026-11-21: these targets were
+// rejected and their draws lost). The shadow stands for the surface while a
+// write-back is pending or nothing else has written the surface since (seed).
+@interface SkyShadow : NSObject {
+@public
+    SkyMem mem;
+    size_t pitch, rowBytes, rows;
+    uint32_t seed;
+    int pending;
+    uint64_t used;
+}
+@end
+@implementation SkyShadow
+- (void)dealloc {
+    sky_free(&mem);
+}
+@end
+
+static os_unfair_lock shadow_lock = OS_UNFAIR_LOCK_INIT;
+static NSMutableDictionary<NSNumber *, SkyShadow *> *shadows;
+static const char sky_writeback_key;
+
+// the shadow of a surface if it holds the surface's contents
+static SkyShadow *shadow_current(IOSurfaceRef surf) {
+    os_unfair_lock_lock(&shadow_lock);
+    SkyShadow *sh = shadows[@(IOSurfaceGetID(surf))];
+    if (sh && !sh->pending && sh->seed != IOSurfaceGetSeed(surf))
+        sh = nil;
+    if (sh)
+        sh->used = sky_commits;
+    os_unfair_lock_unlock(&shadow_lock);
+    return sh;
+}
+
+// make `rt` the surface's shadow for a pass of `owner` (a command buffer)
+static BOOL shadow_target(IOSurfaceRef surf, id owner, BOOL load, SkyImport *rt) {
+    enum { SHADOW_MAX_BYTES = 96 << 20 };
+    size_t rowBytes = IOSurfaceGetWidth(surf) * IOSurfaceGetBytesPerElement(surf), rows = IOSurfaceGetHeight(surf);
+    size_t pitch = (rowBytes + 63) & ~(size_t)63, sbpr = IOSurfaceGetBytesPerRow(surf);
+    if (!rowBytes || rowBytes > sbpr)
+        return NO;
+    uint32_t sid = IOSurfaceGetID(surf);
+    os_unfair_lock_lock(&shadow_lock);
+    if (!shadows)
+        shadows = [NSMutableDictionary dictionary];
+    SkyShadow *sh = shadows[@(sid)];
+    if (sh && (sh->pitch != pitch || sh->rows != rows) && !sh->pending) {
+        [shadows removeObjectForKey:@(sid)];
+        sh = nil;
+    }
+    if (!sh) {
+        size_t total = pitch * rows;
+        for (SkyShadow *o in shadows.allValues)
+            total += o->mem.size;
+        // evict the least recently used shadows nobody waits on
+        while (total > SHADOW_MAX_BYTES) {
+            NSNumber *victim = nil;
+            uint64_t oldest = UINT64_MAX;
+            for (NSNumber *k in shadows) {
+                SkyShadow *o = shadows[k];
+                if (!o->pending && o->used + 2 <= sky_commits && o->used < oldest) {
+                    oldest = o->used;
+                    victim = k;
+                }
+            }
+            if (!victim)
+                break;
+            total -= shadows[victim]->mem.size;
+            [shadows removeObjectForKey:victim];
+        }
+        sh = [SkyShadow new];
+        if (!sky_alloc(pitch * rows, &sh->mem)) {
+            os_unfair_lock_unlock(&shadow_lock);
+            static int nf;
+            if (nf++ < 5)
+                sky_log("shadow %zux%zu: no memory", rowBytes / IOSurfaceGetBytesPerElement(surf), rows);
+            return NO;
+        }
+        sh->pitch = pitch;
+        sh->rowBytes = rowBytes;
+        sh->rows = rows;
+        sh->seed = ~IOSurfaceGetSeed(surf);
+        shadows[@(sid)] = sh;
+        static int nl;
+        if (nl++ < 10)
+            sky_log("shadow target for surface %u: %zux%zu, bpr %zu -> %zu", sid,
+                    rowBytes / IOSurfaceGetBytesPerElement(surf), rows, sbpr, pitch);
+    }
+    // contents the pass loads: the surface's, unless the GPU still owns them
+    if (load && !sh->pending && sh->seed != IOSurfaceGetSeed(surf)) {
+        IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+        const uint8_t *src = IOSurfaceGetBaseAddress(surf);
+        for (size_t y = 0; y < rows; y++)
+            memcpy((uint8_t *)sh->mem.cpu + y * pitch, src + y * sbpr, rowBytes);
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    }
+    sh->pending++;
+    sh->used = sky_commits;
+    os_unfair_lock_unlock(&shadow_lock);
+    NSMutableArray *wb = objc_getAssociatedObject(owner, &sky_writeback_key);
+    if (!wb) {
+        wb = [NSMutableArray array];
+        objc_setAssociatedObject(owner, &sky_writeback_key, wb, OBJC_ASSOCIATION_RETAIN);
+    }
+    [wb addObject:@[sh, (__bridge id)surf]];
+    rt->iova = sh->mem.iova;
+    rt->offset = 0;
+    rt->bpr = pitch;
+    return YES;
+}
+
+// a command buffer finished: copy its shadow targets back into their surfaces
+void sky_shadow_writeback(id owner, BOOL completed) {
+    NSMutableArray *wb = objc_getAssociatedObject(owner, &sky_writeback_key);
+    for (NSArray *e in wb) {
+        SkyShadow *sh = e[0];
+        IOSurfaceRef surf = (__bridge IOSurfaceRef)e[1];
+        os_unfair_lock_lock(&shadow_lock);
+        BOOL last = --sh->pending == 0;
+        os_unfair_lock_unlock(&shadow_lock);
+        if (!last || !completed)
+            continue;
+        IOSurfaceLock(surf, 0, NULL);
+        uint8_t *dst = IOSurfaceGetBaseAddress(surf);
+        size_t sbpr = IOSurfaceGetBytesPerRow(surf);
+        for (size_t y = 0; y < sh->rows; y++)
+            memcpy(dst + y * sbpr, (const uint8_t *)sh->mem.cpu + y * sh->pitch, sh->rowBytes);
+        IOSurfaceUnlock(surf, 0, NULL);
+        os_unfair_lock_lock(&shadow_lock);
+        if (!sh->pending)
+            sh->seed = IOSurfaceGetSeed(surf);
+        os_unfair_lock_unlock(&shadow_lock);
+    }
+    objc_setAssociatedObject(owner, &sky_writeback_key, nil, OBJC_ASSOCIATION_RETAIN);
 }
 
 // per-command-buffer upload memory for setVertexBytes, freed with it
@@ -820,7 +961,11 @@ static void load_ubos(NSMutableData *s, uint32_t op, uint32_t sb, const SkyProgU
         note_surface(_owner, &im);
         base = im.iova + im.offset;
         bpr = im.bpr;
-        if (bpr & 63) {
+        SkyShadow *sh = (bpr & 63) ? shadow_current(surf) : nil;
+        if (sh && rowBytes <= sh->rowBytes && rows <= sh->rows) {
+            base = sh->mem.iova;
+            bpr = sh->pitch;
+        } else if (bpr & 63) {
             IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
             cpu = IOSurfaceGetBaseAddress(surf);
         }
@@ -886,6 +1031,8 @@ static void load_ubos(NSMutableData *s, uint32_t op, uint32_t sb, const SkyProgU
     os_unfair_lock_unlock(&lock);
     const SkyMem *u = &up->mem;
     NSMutableData *s = _s;
+    // the copies move bytes: an 8-byte RGBA16F pixel goes as two RGBA8 ones
+    uint32_t cw = (_info & 0xff) == FMT6_16_16_16_16_FLOAT ? 2 * _w : _w;
     uint64_t ts = sky_code.iova + CODE_TS;
     wfi(s);
     ccu_flush_wait(s, ts); // draws so far reach memory
@@ -905,7 +1052,7 @@ static void load_ubos(NSMutableData *s, uint32_t op, uint32_t sb, const SkyProgU
         uint32_t z3[3] = {0, 0, 0}, z4[4] = {0, 0, 0, 0};
         reg(s, 0x8c20, z3, 3);
         reg(s, 0x8c2c, z4, 4);
-        uint32_t tl[2] = {0, (_w - 1) | ((_h - 1) << 16)};
+        uint32_t tl[2] = {0, (cw - 1) | ((_h - 1) << 16)};
         reg(s, 0x8405, tl, 2);
         event(s, 0x3f);
         wfi(s);
@@ -925,15 +1072,15 @@ static void load_ubos(NSMutableData *s, uint32_t op, uint32_t sb, const SkyProgU
     reg(s, 0x8c20, zero3, 3);
     uint64_t src = _rt.iova + _rt.offset, dst = u->iova;
     // TPL1_A2D_SRC_TEXTURE_INFO..: RGBA8 linear, size, base, pitch (as copyRows)
-    uint32_t tex[5] = {fmt | (1 << 20) | (1 << 22), _w | (_h << 15), (uint32_t)src, (uint32_t)(src >> 32),
+    uint32_t tex[5] = {fmt | (1 << 20) | (1 << 22), cw | (_h << 15), (uint32_t)src, (uint32_t)(src >> 32),
                        (uint32_t)(_rt.bpr >> 6) << 9};
     reg(s, 0xb4c0, tex, 5);
     reg(s, 0xb4ca, zero3, 3);
-    uint32_t sc[4] = {0, (_w - 1) << 8, 0, (_h - 1) << 8};
+    uint32_t sc[4] = {0, (cw - 1) << 8, 0, (_h - 1) << 8};
     reg(s, 0x8401, sc, 4); // GRAS_A2D_SRC_XMIN..YMAX
     uint32_t info[4] = {fmt, (uint32_t)dst, (uint32_t)(dst >> 32), (uint32_t)(_rt.bpr >> 6)};
     reg(s, 0x8c17, info, 4); // RB_A2D_DEST_BUFFER_*
-    uint32_t tl[2] = {0, (_w - 1) | ((_h - 1) << 16)};
+    uint32_t tl[2] = {0, (cw - 1) | ((_h - 1) << 16)};
     reg(s, 0x8405, tl, 2); // GRAS_A2D_DEST_TL/BR
     event(s, 0x3f);
     wfi(s);
@@ -1007,7 +1154,8 @@ uint64_t sky_perf_draw_ticks, sky_perf_draws, sky_perf_tex_ticks, sky_perf_fb_ti
             }
             memset(tex[i], 0, 64);
             // the target's format: RB uses 10_10_10_2_UNORM_DEST (0x37), the TP 0x36
-            uint32_t tfmt = (_info & 0xff) == 0x37 ? 0x36 : FMT6_8_8_8_8_UNORM;
+            uint32_t tfmt = (_info & 0xff) == 0x37 ? 0x36
+                          : (_info & 0xff) == FMT6_16_16_16_16_FLOAT ? FMT6_16_16_16_16_FLOAT : FMT6_8_8_8_8_UNORM;
             tex[i][0] = (0 | 1 << 3 | 2 << 6 | 3 << 9) << 4 | (tfmt << 22) | ((_info >> 13 & 3) << 30);
             tex[i][1] = _w | (_h << 15);
             tex[i][2] = ((uint32_t)_rt.bpr << 7) | (1u << 29);
@@ -1090,7 +1238,7 @@ uint64_t sky_perf_draw_ticks, sky_perf_draws, sky_perf_tex_ticks, sky_perf_fb_ti
     uint32_t mrt[6] = {_info, (uint32_t)(_rt.bpr >> 6), 0, (uint32_t)(_rt.iova + _rt.offset),
                        (uint32_t)((_rt.iova + _rt.offset) >> 32), 0};
     reg(s, 0x8822, mrt, 6);
-    reg1(s, 0xa996, FMT6_8_8_8_8_UNORM);
+    reg1(s, 0xa996, (_info & 0xff) == FMT6_16_16_16_16_FLOAT ? FMT6_16_16_16_16_FLOAT : FMT6_8_8_8_8_UNORM);
     uint32_t zero6[6] = {0};
     for (uint32_t i = 1; i < 8; i++) {
         reg(s, 0x8822 + 8 * i, zero6, 6);
@@ -1232,7 +1380,7 @@ uint64_t sky_perf_draw_ticks, sky_perf_draws, sky_perf_tex_ticks, sky_perf_fb_ti
     uint32_t mrt[6] = {_info, (uint32_t)(_rt.bpr >> 6), 0, (uint32_t)(_rt.iova + _rt.offset),
                        (uint32_t)((_rt.iova + _rt.offset) >> 32), 0};
     reg(s, 0x8822, mrt, 6);
-    reg1(s, 0xa996, FMT6_8_8_8_8_UNORM);
+    reg1(s, 0xa996, (_info & 0xff) == FMT6_16_16_16_16_FLOAT ? FMT6_16_16_16_16_FLOAT : FMT6_8_8_8_8_UNORM);
     uint32_t zero6[6] = {0};
     for (uint32_t i = 1; i < 8; i++) {
         reg(s, 0x8822 + 8 * i, zero6, 6);
@@ -1408,7 +1556,7 @@ uint64_t sky_perf_draw_ticks, sky_perf_draws, sky_perf_tex_ticks, sky_perf_fb_ti
     uint32_t mrt[6] = {_info, (uint32_t)(_rt.bpr >> 6), 0, (uint32_t)(_rt.iova + _rt.offset),
                        (uint32_t)((_rt.iova + _rt.offset) >> 32), 0};
     reg(s, 0x8822, mrt, 6);
-    reg1(s, 0xa996, FMT6_8_8_8_8_UNORM);
+    reg1(s, 0xa996, (_info & 0xff) == FMT6_16_16_16_16_FLOAT ? FMT6_16_16_16_16_FLOAT : FMT6_8_8_8_8_UNORM);
     uint32_t zero6[6] = {0};
     for (uint32_t i = 1; i < 8; i++) {
         reg(s, 0x8822 + 8 * i, zero6, 6);
@@ -1711,6 +1859,21 @@ static void begin_pass(NSMutableData *s, SkyImport rt, uint32_t w, uint32_t h, M
         for (int i = 0; i < 4; i++)
             rgba[i] = (w >> (8 * i)) & 0xff;
     }
+    if (c.texture.pixelFormat == MTLPixelFormatRGBA16Float) {
+        // 8-byte pixels filled as two RGBA8 ones: exact when R,G = B,A (zero,
+        // the usual clear); otherwise R,G is used for both halves
+        __fp16 x[2] = {(__fp16)cc.red, (__fp16)cc.green};
+        uint32_t wd;
+        memcpy(&wd, x, 4);
+        if (cc.red != cc.blue || cc.green != cc.alpha) {
+            static int nc;
+            if (nc++ < 3)
+                sky_log("RGBA16F clear %.2f %.2f %.2f %.2f approximated", cc.red, cc.green, cc.blue, cc.alpha);
+        }
+        for (int i = 0; i < 4; i++)
+            rgba[i] = (wd >> (8 * i)) & 0xff;
+        w *= 2;
+    }
     uint32_t blt = (1 << 7) | (FMT6_8_8_8_8_UNORM << 8) | (0xf << 20);
     reg1(s, 0x8c00, blt);                                      // RB_A2D_BLT_CNTL
     reg1(s, 0x8400, blt);                                      // GRAS_A2D_BLT_CNTL
@@ -1739,7 +1902,8 @@ id sky_draw_encoder(id<MTLDevice> dev, MTLRenderPassDescriptor *d, NSMutableData
     id<MTLTexture> t = c.texture;
     IOSurfaceRef surf = t.iosurface;
     MTLPixelFormat f = t.pixelFormat;
-    BOOL fmt_ok = sky_is_bgra8(f) || sky_is_xr10(f) || f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatRGBA8Unorm_sRGB;
+    BOOL fmt_ok = sky_is_bgra8(f) || sky_is_xr10(f) || f == MTLPixelFormatRGBA8Unorm || f == MTLPixelFormatRGBA8Unorm_sRGB ||
+                  f == MTLPixelFormatRGBA16Float;
     SkyImport rt = {0};
     BOOL cr = code_ready();
     // a render target is flushed from the CPU caches once, on its first use:
@@ -1762,6 +1926,8 @@ id sky_draw_encoder(id<MTLDevice> dev, MTLRenderPassDescriptor *d, NSMutableData
         if (first)
             note_surface(owner, &rt);
     }
+    if (imp && fmt_ok && (rt.bpr & 63))
+        imp = shadow_target(surf, owner, c.loadAction == MTLLoadActionLoad, &rt);
     if (!surf || !fmt_ok || !cr || !imp || (rt.bpr & 63)) {
         static int n;
         if (n++ < 40)
@@ -1778,8 +1944,9 @@ id sky_draw_encoder(id<MTLDevice> dev, MTLRenderPassDescriptor *d, NSMutableData
     begin_pass(stream, rt, w, h, c);
     // BGRA memory order: COLOR_SWAP WXYZ (a3xx_color_swap 1) in RB_MRT[0].BUF_INFO
     BOOL bgra = sky_is_bgra8(f);
-    uint32_t info = sky_is_xr10(f) ? 0x37u /* FMT6_10_10_10_2_UNORM_DEST */
-                                   : FMT6_8_8_8_8_UNORM | ((bgra ? 1u : 0u) << 13);
+    uint32_t info = sky_is_xr10(f)                 ? 0x37u /* FMT6_10_10_10_2_UNORM_DEST */
+                    : f == MTLPixelFormatRGBA16Float ? FMT6_16_16_16_16_FLOAT
+                                                     : FMT6_8_8_8_8_UNORM | ((bgra ? 1u : 0u) << 13);
     SkyDrawEncoder *e = [[SkyDrawEncoder alloc] initWithStream:stream owner:owner target:rt surface:surf width:w height:h info:info];
     e.device = dev;
     return e;

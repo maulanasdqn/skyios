@@ -59,7 +59,8 @@ def main():
     consts = {}
     for kv in args[1].split():
         k, v = kv.split('=')
-        consts[k] = int(v)
+        # uchar3 constants are logged as 'a,b,c'
+        consts[k] = sum(int(x) << 8 * i for i, x in enumerate(v.split(',')))
 
     # @_Z17fc_blend_function.MTL_FC_INIT_30_h = internal addrspace(2) externally_initialized constant i8 undef, ...
     fc = re.compile(r'^(@_Z\d+fc_(\w+?)\.MTL_FC_INIT_\d+_(\w+)) = internal (unnamed_addr )?addrspace\(2\) '

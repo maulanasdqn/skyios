@@ -538,6 +538,8 @@ static uint32_t pkt7(uint32_t op, uint32_t cnt) {
 }
 
 - (void)finish:(MTLCommandBufferStatus)status {
+    extern void sky_shadow_writeback(id owner, BOOL completed);
+    sky_shadow_writeback(self, status == MTLCommandBufferStatusCompleted);
     _t1 = sky_now();
     _status = status;
     for (MTLCommandBufferHandler h in _completed)

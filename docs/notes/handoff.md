@@ -160,6 +160,19 @@ localbuild/build60.log (path dxb->ci-clean2) and relinked with ci-clean2/build.l
   probe128 lock screen shot: **clock text present with the shared fbfetch scratch** (fixes the
   probe100-107 problem). Still rejected: RGBA16Float (115) render targets (64 px wide).
   Daily image rebuilt with bundle 8fc73da + k125 (02:10).
+- **Daily run 02:09 -> 17:51 (2026-11-21, observed in logs/live-skyios-daily-1119.txt):** ~15 h up,
+  no GPU fault, 60.0 swaps/s idle. While the user used it: 17 pipelines without a program
+  (extended_range=1 variants for 554 targets, noise variants, blend 41 2-image, uchar3
+  color_opcodes0=5,1,6). 554 targets 1125x2436 (app snapshots, opened Settings) rejected because
+  bpr 4512 is not 64-byte aligned; RGBA16Float targets 64 px (bpr 512) rejected.
+- **55207d3:** keys added (genprogs 99 of 101; airspec parses uchar3 'a,b,c'; glslangValidator
+  is no longer in /opt/homebrew, copied the Android SDK one to the scratchpad bin);
+  RGBA16Float targets (RB/SP_PS_MRT 0x62, fbfetch 0x62, copies/clears as 2x RGBA8 width; non-zero
+  clears with R,G != B,A approximated + logged); unaligned-row targets drawn into an aligned
+  shadow (SkyShadow, <= 96 MiB, LRU), sampled from the shadow while pending/seed unchanged,
+  written back by the CPU in -finish:. Images built, NOT booted yet: shim-boot-probe129.img
+  (probe125 cmdline: sweetreboot=600 + shots) and the daily shim-boot-skyios-gpu.img (k125 +
+  tool-probe129; previous daily payload saved as scratchpad payload-skyios-gpu.k125-128.bin).
   - Still open: formats 550/554 (BGRA10_XR, 19 draws), 2 programs with color_opcodes arrays, the
     fbfetch scratch reuse (lock clock text), the user asked for an iOS upgrade after stabilising.
 - **`skyios-shim/out/shim-boot-skyios-gpu.img`** (2026-11-20 12:40): daily cmdline (no auto

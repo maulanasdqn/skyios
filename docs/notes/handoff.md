@@ -173,6 +173,13 @@ localbuild/build60.log (path dxb->ci-clean2) and relinked with ci-clean2/build.l
   written back by the CPU in -finish:. Images built, NOT booted yet: shim-boot-probe129.img
   (probe125 cmdline: sweetreboot=600 + shots) and the daily shim-boot-skyios-gpu.img (k125 +
   tool-probe129; previous daily payload saved as scratchpad payload-skyios-gpu.k125-128.bin).
+- **probe129 (2026-11-21 18:00-18:11, bundle 55207d3 + k125):** 60.0 swaps/s, no GPU fault, one
+  pipeline without program (blend 54 dest_count=1 image_function0=36 texture_function=3).
+  Touch: first frames after the 3rd watchdog reset (~70 s), 4 swipes from the bottom edge, then
+  the 3 s quiet reset fired and no frame came for the rest of the run (12 more resets, PID ok,
+  INT high, head 0). Settings/CC/switcher never opened -> shadow targets and new programs
+  untested. Unknown whether the panel was off (auto-lock) or touch stuck; asked the user.
+  Correlation in older logs is inconclusive (daily: frames came back after resets #597/#1039/#1555).
   - Still open: formats 550/554 (BGRA10_XR, 19 draws), 2 programs with color_opcodes arrays, the
     fbfetch scratch reuse (lock clock text), the user asked for an iOS upgrade after stabilising.
 - **`skyios-shim/out/shim-boot-skyios-gpu.img`** (2026-11-20 12:40): daily cmdline (no auto
